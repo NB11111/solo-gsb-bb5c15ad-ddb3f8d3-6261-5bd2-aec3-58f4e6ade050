@@ -398,3 +398,73 @@ class ExportVerifyResponse(BaseModel):
     expected_sha256: str
     received_sha256: str
     manifest: ExportManifest
+
+
+# ---------------------------------------------------------------------------
+# 双设备同指标并行测量比对
+# ---------------------------------------------------------------------------
+
+class ComparisonSideMeasurement(BaseModel):
+    """配对中某一侧（参考仪器或待检仪器）的一条测量。"""
+
+    device_id: str
+    seq: int = Field(description="所属已提交包序号")
+    measurement_index: int = Field(
+        description="测量在包 measurements 中的位置（从 1 起）"
+    )
+    value: float = Field(description="原始读数（不做校准换算）")
+    unit: Optional[str] = None
+    time: datetime = Field(
+        description="测量时间：优先取测量 ts，缺省取包 sent_at（均归一化为 UTC）"
+    )
+    time_source: Literal["ts", "sent_at"] = Field(
+        description="time 的来源：测量自身 ts 或包 sent_at"
+    )
+
+
+class ComparisonPair(BaseModel):
+    """一对参考 / 待检测量及其差值判定。"""
+
+    index: int = Field(description="配对在结果中的序号（从 1 起，按时间顺序）")
+    pair_time: datetime = Field(description="配对时间：取参考仪器读数时间（UTC）")
+    reference: ComparisonSideMeasurement = Field(description="参考仪器读数")
+    target: ComparisonSideMeasurement = Field(description="待检仪器读数")
+    abs_value_diff: float = Field(description="两侧读数绝对数值差 |ref - target|")
+    time_diff_seconds: float = Field(description="两侧测量时间差绝对值（秒）")
+    over_tolerance: bool = Field(
+        description="绝对数值差是否超差：abs_value_diff > value_tolerance"
+    )
+
+
+class ComparisonSummary(BaseModel):
+    """比对汇总：配对数与两侧候选 / 未配对 / 被忽略条数。"""
+
+    pair_count: int = Field(description="成功配对数")
+    reference_candidate_count: int = Field(description="参考设备候选测量条数")
+    target_candidate_count: int = Field(description="待检设备候选测量条数")
+    reference_unpaired_count: int = Field(description="参考设备未配对条数")
+    target_unpaired_count: int = Field(description="待检设备未配对条数")
+    reference_untimed_count: int = Field(
+        description="参考设备既无测量 ts 也无包 sent_at、被忽略的测量条数"
+    )
+    target_untimed_count: int = Field(
+        description="待检设备既无测量 ts 也无包 sent_at、被忽略的测量条数"
+    )
+
+
+class ComparisonResponse(BaseModel):
+    """双设备同指标并行测量比对结果。"""
+
+    model_config = {"populate_by_name": True}
+
+    reference_device: str
+    target_device: str
+    metric: str
+    from_: datetime = Field(alias="from", description="UTC 查询范围起点（含）")
+    to: datetime = Field(description="UTC 查询范围终点（不含）")
+    max_time_diff_seconds: float
+    value_tolerance: float
+    pairs: List[ComparisonPair] = Field(
+        description="按时间顺序的配对，每条测量最多出现一次"
+    )
+    summary: ComparisonSummary

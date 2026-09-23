@@ -10,6 +10,7 @@
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
+- **双设备并行测量比对**：交接班时按设备、指标、UTC 时间段并行核对**参考仪器与待检仪器**的已提交读数；仅在单位相同且时间差不超过上限时配对，先最大化配对数、再最小化配对时间差总和（平局按配对序号字典序决胜），输出每对读数、绝对数值差、是否超差及两侧未配对汇总；单侧超过 200 条明确拒绝。
 
 ## 快速开始
 
@@ -102,6 +103,7 @@ pytest tests/
 | GET | `/api/v1/exports/{id}/manifest` | 查询导出 manifest |
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
 | POST | `/api/v1/exports/{id}/verify` | 提交导出内容 SHA-256 校验完整性 |
+| GET | `/api/v1/metrics/compare` | 双设备同指标并行测量配对比对（交接班核对参考/待检仪器读数） |
 
 ## 窗口聚合（Rollup）
 
@@ -471,6 +473,62 @@ curl -X POST localhost:8000/api/v1/exports/$EID/verify \
 #  "manifest":{ ... }}
 ```
 
+## 双设备并行测量比对（Comparisons）
+
+交接班时核对**参考仪器**与**待检仪器**在同一 UTC 时间段内对同一指标的并行读数。
+比对**只读取已提交（committed）的原始包**：缓冲包、重复包、作废序号、告警均不参与，
+原始包不做任何改写（读数始终为原始值，不套校准）。
+
+`GET /api/v1/metrics/compare`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `reference_device` | 是 | 参考仪器设备号（未知设备返回 `404`） |
+| `target_device` | 是 | 待检仪器设备号（必须与参考设备不同，否则 `422`） |
+| `metric` | 是 | 共同比对的指标名 |
+| `from` / `to` | 是 | UTC 半开时间范围 `[from, to)`，ISO 8601（不带时区按 UTC 处理） |
+| `max_time_diff_seconds` | 是 | 允许的最大配对时间偏差（秒），`>= 0`；时间差超过上限的两条测量不配对 |
+| `value_tolerance` | 是 | 允许的数值偏差，`>= 0`；`|参考读数 - 待检读数|` 严格大于该值时标记超差（相等不算超差） |
+
+候选测量的取数与排序：
+
+- 仅扫描两侧设备的**已提交包**，按包序号（seq）升序、包内 `measurements` 位置展开；
+- 每条测量的时间**优先使用测量自身的 `ts`**，缺省时使用所属包的 `sent_at`；
+  两者都没有的测量**直接忽略**（计入汇总里的 `*_untimed_count`，不占候选名额）；
+- 只保留时间落在 `[from, to)` 内的候选；
+- 同时间的测量按**包序号、再按包内位置**稳定排序。
+
+配对规则（两侧候选各保持时间顺序）：
+
+- 仅当两侧**单位相同**且 `|t_ref - t_target| <= max_time_diff_seconds` 时才允许配对
+  （两侧都未提供单位视为相同；一侧有单位、另一侧没有视为不同）；
+- 配对保持两侧时间顺序（不交叉），**每条测量最多配对一次**；
+- 优化目标依次为：① **配对数最多**；② 全部配对的**时间差绝对值总和最小**；
+  ③ 仍平局时，取「按排序后的配对序号 `(左侧序号, 右侧序号)` 元组序列」**字典序最小**者。
+- **单侧候选超过 200 条时返回 `422` 明确拒绝，不截断、不抽样**（响应 detail 给出
+  两侧实际条数）；请缩小 UTC 时间范围后重试。
+
+响应：`pairs` 按时间顺序给出每个配对（配对时间取参考仪器读数时间），含两侧的
+包序号、包内位置（`measurement_index` 从 1 起）、读数与单位、时间来源（`ts` /
+`sent_at`）、绝对数值差、时间差（秒）及 `over_tolerance`；`summary` 汇总配对数、
+两侧候选数、未配对数及被忽略的无时间测量数。
+
+```bash
+curl 'localhost:8000/api/v1/metrics/compare?reference_device=ref-meter-01&target_device=uut-meter-01&metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&max_time_diff_seconds=2&value_tolerance=0.5'
+# => 200
+# {"reference_device":"ref-meter-01","target_device":"uut-meter-01","metric":"temperature",
+#  "from":"...","to":"...","max_time_diff_seconds":2.0,"value_tolerance":0.5,
+#  "pairs":[{"index":1,"pair_time":"2026-09-22T08:00:00Z",
+#            "reference":{"device_id":"ref-meter-01","seq":1,"measurement_index":1,
+#                         "value":20.0,"unit":"C","time":"...","time_source":"ts"},
+#            "target":{"device_id":"uut-meter-01","seq":1,"measurement_index":1,
+#                      "value":20.1,"unit":"C","time":"...","time_source":"ts"},
+#            "abs_value_diff":0.1,"time_diff_seconds":0.0,"over_tolerance":false}, ...],
+#  "summary":{"pair_count":2,"reference_candidate_count":2,"target_candidate_count":2,
+#             "reference_unpaired_count":0,"target_unpaired_count":0,
+#             "reference_untimed_count":0,"target_untimed_count":0}}
+```
+
 ### 示例
 
 上报乱序包（seq 2 先到，进入缓冲）：
@@ -535,6 +593,7 @@ app/
   calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算（含区间索引供聚合批量解析）
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
+  comparisons.py  # 双设备同指标并行测量比对：已提交测量取数排序 + 最优配对动态规划（只读，不改写原始数据）
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
@@ -545,6 +604,7 @@ tests/
   test_alerts.py        # 阈值告警测试
   test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试
   test_exports.py       # 归档导出 / 游标 / 摘要校验测试
+  test_comparisons.py   # 双设备并行测量比对：取数排序 / 单位与时间窗口 / 最优配对目标 / 200 条上限测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```
