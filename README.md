@@ -10,6 +10,7 @@
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
 - **设备指标校准**：按设备 + 指标维护线性校准配置（`校准值 = 原始值 × scale + offset`），有效时间段互不重叠（事务内校验），按时刻解析唯一生效配置并计算校准值，不改写已存原始测量；窗口聚合支持可选的校准值模式（`calibrated=true`），按每个已提交包的 `sent_at` 解析当时生效的校准区间计算统计值，无配置沿用原始值。
 - **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回 NDJSON 分页游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传字节稳定，并提供摘要校验接口；导出不触碰提交、缓冲、重复与告警数据。
+- **双设备并行测量比对**：交接班时按设备、指标、UTC 时间段、最大时间偏差与允许数值偏差，只读比对参考仪器与待检仪器已提交包中的同指标读数；测量时间优先取 `ts`、否则取包 `sent_at`，保序一对一配对（先最大化配对数、再最小化时间差总和、平局按配对序号字典序决胜），返回逐对读数差与是否超差及两侧未配对汇总；不改写原始包、缓冲与告警。
 
 ## 快速开始
 
@@ -102,6 +103,7 @@ pytest tests/
 | GET | `/api/v1/exports/{id}/manifest` | 查询导出 manifest |
 | GET | `/api/v1/exports/{id}/pages?cursor=` | NDJSON 分页续传（响应头返回下一个游标） |
 | POST | `/api/v1/exports/{id}/verify` | 提交导出内容 SHA-256 校验完整性 |
+| GET | `/api/v1/comparisons` | 双设备同指标并行测量比对（交接班核对参考 / 待检仪器读数） |
 
 ## 窗口聚合（Rollup）
 
@@ -524,6 +526,65 @@ curl localhost:8000/api/v1/devices/ph-meter-01/committed
 # 范围含作废序号的导出 complete=false，NDJSON 仍只有真实包
 ```
 
+## 双设备并行测量比对（Comparisons）
+
+交接班时核对**参考仪器**与**待检仪器**在同一时间段内对同一指标的读数。
+接口是**纯只读**的：仅查询两侧 `committed` 表中已提交包的原始 payload，
+不写入任何数据，也不改写原始包、缓冲、重复、作废、告警与校准。
+
+`GET /api/v1/comparisons`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `reference_device` | 是 | 参考仪器设备号 |
+| `target_device` | 是 | 待检仪器设备号（不得与参考设备相同） |
+| `metric` | 是 | 指标名，只取该指标的测量 |
+| `from` / `to` | 是 | UTC 时间段，半开区间 `[from, to)`，ISO 8601（不带时区按 UTC） |
+| `max_time_delta_seconds` | 是 | 允许的最大时间偏差（秒），`>= 0`；两侧时间差不超过该值才允许配对 |
+| `allowed_value_diff` | 是 | 允许的读数绝对数值偏差，`>= 0`；绝对差**严格大于**该值标记 `exceeded=true`（相等不算超差） |
+
+候选测量与排序：
+
+- 每条测量的有效时间**优先取自身 `ts`，否则取所属包的 `sent_at`**；
+  两者都没有的测量直接**忽略**；
+- 仅保留有效时间落在 `[from, to)` 内的测量；
+- 同一侧按 **(有效时间, 包序号 seq, 包内位置 position)** 升序排序——
+  同时间先按包序号、再按该测量在包 `measurements` 中的原始下标排列；
+- 缓冲区中尚未提交的包不参与；单侧候选**硬上限 200 条，超过直接
+  `422` 拒绝（明确报错，绝不截断）**，请缩小 UTC 时间范围后重试。
+
+配对规则（保序二分匹配，每条测量最多配对一次）：
+
+- 仅当两侧**单位相同**（两侧都未填 `unit` 视为相同；仅一侧缺失视为不同）
+  且有效时间差绝对值 **不超过** `max_time_delta_seconds` 时才能配对；
+- 配对保持两侧各自的时间顺序（不交叉）；优化目标依次为：
+  ① 最大化配对数；② 最小化全部配对的时间差总和；
+  ③ 仍平局时按排序后的配对序号序列 `((ref_idx, target_idx), ...)`
+  字典序最小决胜——结果唯一确定，重复调用完全一致。
+
+响应：逐对返回配对时间（取参考侧有效时间）、两侧的包序号 / 包内位置 /
+有效时间 / 时间来源（`ts` 或 `sent_at`）/ 读数 / 单位、时间差（秒）、
+绝对数值差、是否超差；汇总给出两侧候选数、配对数与两侧未配对数、
+超差配对数。未知设备返回 `404`；两侧同设备、时间范围倒置、候选超限等
+返回 `422`。
+
+```bash
+curl 'localhost:8000/api/v1/comparisons?reference_device=ph-ref-01&target_device=ph-dut-02&metric=temperature&from=2026-09-23T08:00:00Z&to=2026-09-23T09:00:00Z&max_time_delta_seconds=5&allowed_value_diff=0.5'
+# => {"reference_device":"ph-ref-01","target_device":"ph-dut-02","metric":"temperature",
+#     "from":"2026-09-23T08:00:00Z","to":"2026-09-23T09:00:00Z",
+#     "max_time_delta_seconds":5.0,"allowed_value_diff":0.5,
+#     "reference_count":3,"target_count":3,"paired_count":2,
+#     "reference_unpaired_count":1,"target_unpaired_count":1,"exceeded_count":1,
+#     "pairs":[{"pair_time":"2026-09-23T08:00:10Z",
+#       "reference":{"device_id":"ph-ref-01","seq":1,"position":0,
+#                    "time":"2026-09-23T08:00:10Z","time_source":"ts",
+#                    "value":20.0,"unit":"C"},
+#       "target":{"device_id":"ph-dut-02","seq":1,"position":0,
+#                 "time":"2026-09-23T08:00:12Z","time_source":"ts",
+#                 "value":20.3,"unit":"C"},
+#       "time_delta_seconds":2.0,"abs_value_diff":0.3,"exceeded":false}, ...]}
+```
+
 ## 项目结构
 
 ```
@@ -535,6 +596,7 @@ app/
   calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算（含区间索引供聚合批量解析）
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径
   exports.py      # 只读归档导出：不可变快照、NDJSON 游标编解码、manifest 摘要校验（范围含作废段时 complete=false）
+  comparisons.py  # 双设备同指标并行测量比对：候选时间排序、保序二分匹配（配对数>时间差总和>字典序）
   db.py           # SQLite 连接与建表（启动时自动执行）
   schemas.py      # Pydantic 模型
 tests/
@@ -545,6 +607,7 @@ tests/
   test_alerts.py        # 阈值告警测试
   test_calibrations.py  # 校准配置 / 解析 / 原始数据不变测试
   test_exports.py       # 归档导出 / 游标 / 摘要校验测试
+  test_comparisons.py   # 双设备并行测量比对测试（排序 / 保序匹配 / 决胜 / 200 上限 / 只读）
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

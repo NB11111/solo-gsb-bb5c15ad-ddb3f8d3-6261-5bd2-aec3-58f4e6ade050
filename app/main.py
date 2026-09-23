@@ -23,12 +23,14 @@ from .calibrations import (
     resolve_calibration,
 )
 from . import exports
+from .comparisons import ComparisonError, compare_devices
 from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
 from .rollup import RollupError, compute_rollup
 from .schemas import (
     AlertEventsResponse,
     AlertEventOut,
+    ComparisonResponse,
     CurrentAlertOut,
     CurrentAlertsResponse,
     CalibrationCreate,
@@ -332,6 +334,61 @@ def get_metrics_rollup(
                 calibrated,
             )
         except RollupError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 双设备同指标并行测量比对（交接班核对参考 / 待检仪器读数）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/comparisons", response_model=ComparisonResponse)
+def get_comparison(
+    reference_device: str = Query(
+        min_length=1, description="参考仪器设备号"
+    ),
+    target_device: str = Query(
+        min_length=1, description="待检仪器设备号"
+    ),
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    from_: datetime = Query(alias="from", description="UTC 时间段起点（含），ISO 8601"),
+    to: datetime = Query(description="UTC 时间段终点（不含），ISO 8601"),
+    max_time_delta_seconds: float = Query(
+        ge=0, description="允许的最大时间偏差（秒）；时间差不超过该值才允许配对"
+    ),
+    allowed_value_diff: float = Query(
+        ge=0, description="允许的读数绝对数值偏差；严格大于该值标记为超差"
+    ),
+):
+    """双设备同指标并行测量比对（只读，不改写原始包、缓冲与告警）。
+
+    仅查询两侧已提交包中的同指标测量：每条测量优先用 ts，否则用包
+    sent_at，均无则忽略；按 (时间, 包序号, 包内位置) 排序。仅在单位
+    相同且时间差不超过 max_time_delta_seconds 时配对，配对保持两侧
+    时间顺序、每条测量最多一次：先最大化配对数，再最小化配对时间差
+    总和，平局按配对序号字典序决胜。单侧候选超过 200 条直接 422 拒绝。
+    """
+    with db.get_conn() as conn:
+        for label, device_id in (
+            ("参考设备", reference_device),
+            ("待检设备", target_device),
+        ):
+            dev = conn.execute(
+                "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            if dev is None:
+                raise HTTPException(status_code=404, detail=f"未知{label}: {device_id}")
+        try:
+            return compare_devices(
+                conn,
+                reference_device,
+                target_device,
+                metric,
+                from_,
+                to,
+                max_time_delta_seconds,
+                allowed_value_diff,
+            )
+        except ComparisonError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

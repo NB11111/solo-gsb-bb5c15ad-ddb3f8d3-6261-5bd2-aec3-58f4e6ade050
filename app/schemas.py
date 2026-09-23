@@ -398,3 +398,59 @@ class ExportVerifyResponse(BaseModel):
     expected_sha256: str
     received_sha256: str
     manifest: ExportManifest
+
+
+# ---------------------------------------------------------------------------
+# 双设备同指标并行测量比对
+# ---------------------------------------------------------------------------
+
+class ComparisonSidePoint(BaseModel):
+    """参与比对的一侧测量：所属包序号、包内位置、有效时间与读数。"""
+
+    device_id: str
+    seq: int = Field(description="测量所属已提交包序号")
+    position: int = Field(description="测量在该包 measurements 中的原始下标（从 0 起）")
+    time: datetime = Field(description="有效时间：优先测量 ts，否则包 sent_at，UTC")
+    time_source: Literal["ts", "sent_at"] = Field(
+        description="有效时间来源：测量自身 ts 或包 sent_at"
+    )
+    value: float = Field(description="测量读数（原始值，不应用校准）")
+    unit: Optional[str] = Field(description="测量单位；未提供时为 null")
+
+
+class ComparisonPair(BaseModel):
+    """一对成功配对的测量。"""
+
+    pair_time: datetime = Field(description="配对时间：参考侧有效测量时间（UTC）")
+    reference: ComparisonSidePoint = Field(description="参考仪器一侧")
+    target: ComparisonSidePoint = Field(description="待检仪器一侧")
+    time_delta_seconds: float = Field(
+        ge=0.0, description="两侧有效测量时间差绝对值（秒），不超过最大时间偏差"
+    )
+    abs_value_diff: float = Field(ge=0.0, description="两侧读数的绝对数值差")
+    exceeded: bool = Field(
+        description="是否超差：绝对数值差严格大于 allowed_value_diff 时为 true"
+    )
+
+
+class ComparisonResponse(BaseModel):
+    """双设备同指标并行测量比对结果。"""
+
+    model_config = {"populate_by_name": True}
+
+    reference_device: str
+    target_device: str
+    metric: str
+    from_: datetime = Field(alias="from", description="比对 UTC 时间范围起点（含）")
+    to: datetime = Field(description="比对 UTC 时间范围终点（不含）")
+    max_time_delta_seconds: float = Field(description="允许的最大时间偏差（秒）")
+    allowed_value_diff: float = Field(description="允许的读数绝对数值偏差")
+    reference_count: int = Field(description="参考侧纳入比对的测量条数")
+    target_count: int = Field(description="待检侧纳入比对的测量条数")
+    paired_count: int = Field(description="配对成功的数量")
+    reference_unpaired_count: int = Field(description="参考侧未配对条数")
+    target_unpaired_count: int = Field(description="待检侧未配对条数")
+    exceeded_count: int = Field(description="超差配对数")
+    pairs: List[ComparisonPair] = Field(
+        description="配对列表，按参考侧（两侧一致的）时间顺序排列"
+    )
